@@ -182,6 +182,15 @@ static void gpm_epoll_close(struct gpm_ctx *gpmctx)
         return;
     }
 
+    if (gpmctx->timerfd >= 0) {
+        /* Remove the timer from the epoll if it exists. This
+         * shouldn't strictly be necessary, but ensures that we
+         * clean up the epoll before closing it. In particular,
+         * perhaps the kernel will refuse to close the timerfd
+         * if we still maintain it in the epollfd? */
+        epoll_ctl(gpmctx->epollfd, EPOLL_CTL_DEL, gpmctx->timerfd, NULL);
+    }
+
     close(gpmctx->epollfd);
     gpmctx->epollfd = -1;
 }
@@ -256,8 +265,6 @@ static int gpm_grab_sock(struct gpm_ctx *gpmctx)
     if (ret) {
         goto done;
     }
-    /* create epoll fd as well */
-    ret = gpm_epoll_setup(gpmctx);
 
 done:
     if (ret) {
@@ -279,6 +286,13 @@ static int gpm_epoll_wait(struct gpm_ctx *gpmctx, uint32_t event_flags)
     memset(&events[1], 0, sizeof(events[1]));
 
     if (gpmctx->epollfd < 0) {
+        /* Note that gpm_epoll_wait is the only place that the epollfd is
+         * constructed. Here, if it doesn't exist, we create it. However,
+         * in the event of a successful wait, we persist the epoll so it
+         * could potentially be reused by the next step (as we wait both
+         * for send and recv on gpmctx->fd. This means that gpm_make_call
+         * must call gpm_release_sock (and thus, gpm_epoll_close) in order
+         * to free the epoll in the event of a successful exchange. */
         ret = gpm_epoll_setup(gpmctx);
         if (ret)
             return ret;
@@ -297,13 +311,16 @@ static int gpm_epoll_wait(struct gpm_ctx *gpmctx, uint32_t event_flags)
         epoll_ret = epoll_wait(gpmctx->epollfd, events, 2, SAFETY_TIMEOUT);
     } while (epoll_ret < 0 && errno == EINTR);
 
+    /* In the below if statements, we cannot return without removing the
+     * event: otherwise, we'd get duplicate events in our epoll. If we do
+     * need to return in the future, we should create a label and make sure
+     * we clean up the epollfd before returning. */
+
     if (epoll_ret < 0) {
         /* Error while waiting that isn't EINTR */
         ret = errno;
-        gpm_epoll_close(gpmctx);
     } else if (epoll_ret == 0) {
         ret = ETIMEDOUT;
-        gpm_epoll_close(gpmctx);
     } else if (epoll_ret == 1 && events[0].data.fd == gpmctx->timerfd) {
         /* Got an event which is only our timer */
         if ((events[0].events & EPOLLIN) == 0) {
@@ -327,7 +344,6 @@ static int gpm_epoll_wait(struct gpm_ctx *gpmctx, uint32_t event_flags)
                 ret = ETIMEDOUT;
             }
         }
-        gpm_epoll_close(gpmctx);
     } else {
         /* If ret == 2, then we ignore the timerfd; that way if the next
          * operation cannot be performed immediately, we timeout and retry.
@@ -342,7 +358,6 @@ static int gpm_epoll_wait(struct gpm_ctx *gpmctx, uint32_t event_flags)
              * is a fatal error; return with EBADFD to distinguish from
              * EBADF in timer_fd case. */
             ret = EBADFD;
-            gpm_epoll_close(gpmctx);
         } else {
             /* We definintely got a EPOLLIN/EPOLLOUT event; return success. */
             ret = 0;
@@ -357,6 +372,14 @@ static int gpm_epoll_wait(struct gpm_ctx *gpmctx, uint32_t event_flags)
          * to continue. */
         if (ret == 0)
             ret = errno;
+        gpm_epoll_close(gpmctx);
+    }
+
+    /* In the event of a (presumably fatal) issue with waiting, ensure we
+     * close (and later, re-open) the epollfd. Earlier versions of
+     * gpm_epoll_wait handled this in the conditionals above; this
+     * simplification ensures we do so consistently in all cases. */
+    if (ret != 0) {
         gpm_epoll_close(gpmctx);
     }
 
